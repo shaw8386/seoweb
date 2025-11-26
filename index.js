@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 // Database URL đưa thẳng vào đây
 const DATABASE_URL =
   process.env.DATABASE_URL ||
-  "postgresql://user:password@hostname:port/dbname"; // TODO: thay bằng real Railway URL
+  "postgresql://postgres:TtpAYoZAzwRiDXxRjWwbiXlUkQjEKneY@postgres.railway.internal:5432/railway"; // TODO: thay bằng real Railway URL
 
 // Railway thường yêu cầu SSL
 const DB_SSL =
@@ -156,7 +156,7 @@ app.listen(PORT, () => {
 
 // Thay trực tiếp đường dẫn DATABASE_URL tại đây
 // Railway sẽ tự động override nếu bạn set trong dashboard
-process.env.DATABASE_URL = "postgresql://user:password@host:port/dbname";
+process.env.DATABASE_URL = "postgresql://postgres:TtpAYoZAzwRiDXxRjWwbiXlUkQjEKneY@postgres.railway.internal:5432/railway";
 
 // SSL luôn bật
 process.env.DB_SSL = "true";
