@@ -119,12 +119,12 @@ app.post("/api/login", async (req, res) => {
     }
 
     // Check IP nếu có
-    if (user.allowed_ip && user.allowed_ip !== ip) {
-      return res.status(403).json({
-        success: false,
-        message: `IP không được phép (chỉ cho phép: ${user.allowed_ip})`,
-      });
-    }
+    // if (user.allowed_ip && user.allowed_ip !== ip) {
+    //   return res.status(403).json({
+    //     success: false,
+    //     message: `IP không được phép (chỉ cho phép: ${user.allowed_ip})`,
+    //   });
+    // }
 
     return res.json({
       success: true,
