@@ -48,7 +48,14 @@ const SOFT_LIMIT_BYTES = Math.floor(R2_MONTHLY_SOFT_LIMIT_GB * 1024 * 1024 * 102
 
 // Optional seed JSON: array accounts
 // [
-//  {"name":"acc_cf_r2_01","account_id":"...","access_key_id":"...","secret_access_key":"...","bucket":"seoweb123","endpoint":"https://<accountid>.r2.cloudflarestorage.com"}
+//  {
+//   "name":"acc_cf_r2_01",
+//   "account_id":"...",
+//   "access_key_id":"...",
+//   "secret_access_key":"...",
+//   "bucket":"seoweb123",
+//   "endpoint":"https://<accountid>.r2.cloudflarestorage.com"
+//  }
 // ]
 const R2_ACCOUNTS_SEED_JSON = (process.env.R2_ACCOUNTS_SEED_JSON || "").trim();
 
@@ -68,7 +75,6 @@ function nowISO() {
 }
 
 function monthKeyUTC(d = new Date()) {
-  // YYYY-MM
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   return `${y}-${m}`;
@@ -84,6 +90,27 @@ function requireHiddenToken(req, res, next) {
 
 function sha1Short(buf) {
   return crypto.createHash("sha1").update(buf).digest("hex").slice(0, 10);
+}
+
+function normalizeEndpoint(endpointRaw, accountIdRaw) {
+  // Ưu tiên endpointRaw, fallback dùng account_id build endpoint chuẩn
+  let ep = (endpointRaw || "").trim();
+  const accountId = (accountIdRaw || "").trim();
+
+  if (!ep && accountId) {
+    ep = `https://${accountId}.r2.cloudflarestorage.com`;
+  }
+
+  if (!ep) return "";
+
+  // nếu user nhập thiếu https://
+  if (!/^https?:\/\//i.test(ep)) {
+    ep = "https://" + ep;
+  }
+
+  // remove trailing slash
+  ep = ep.replace(/\/+$/, "");
+  return ep;
 }
 
 // ========================
@@ -143,6 +170,15 @@ async function initDB() {
     );
   `);
 
+  // KV để nhớ “tháng hiện tại” (để reset đúng đầu tháng)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_kv (
+      k TEXT PRIMARY KEY,
+      v TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   console.log("✔️ DB tables ensured.");
 
   // OPTIONAL: create admin default
@@ -161,7 +197,21 @@ async function initDB() {
       const arr = JSON.parse(R2_ACCOUNTS_SEED_JSON);
       if (Array.isArray(arr)) {
         for (const a of arr) {
-          if (!a?.name) continue;
+          const name = String(a?.name || "").trim();
+          if (!name) continue;
+
+          const account_id = String(a?.account_id || "").trim();
+          const access_key_id = String(a?.access_key_id || "").trim();
+          const secret_access_key = String(a?.secret_access_key || "").trim();
+          const bucket = String(a?.bucket || "").trim();
+          const endpoint = normalizeEndpoint(String(a?.endpoint || ""), account_id);
+
+          // skip nếu thiếu field quan trọng
+          if (!account_id || !access_key_id || !secret_access_key || !bucket || !endpoint) {
+            console.warn(`⚠️ Skip seed account '${name}' because missing fields.`);
+            continue;
+          }
+
           await pool.query(
             `
             INSERT INTO r2_accounts (name, account_id, access_key_id, secret_access_key, bucket, endpoint)
@@ -174,14 +224,7 @@ async function initDB() {
               endpoint=EXCLUDED.endpoint,
               updated_at=NOW()
             `,
-            [
-              String(a.name),
-              String(a.account_id || ""),
-              String(a.access_key_id || ""),
-              String(a.secret_access_key || ""),
-              String(a.bucket || ""),
-              String(a.endpoint || ""),
-            ]
+            [name, account_id, access_key_id, secret_access_key, bucket, endpoint]
           );
         }
         console.log("✔️ Seeded/updated r2_accounts from R2_ACCOUNTS_SEED_JSON");
@@ -192,17 +235,27 @@ async function initDB() {
   }
 }
 
-// Ensure reset each month
+// Reset đúng “đầu tháng” (chỉ khi đổi tháng)
 async function ensureMonthlyReset() {
   const mk = monthKeyUTC();
-  // Không cần “reset” bảng, chỉ cần đảm bảo usage record tạo theo month hiện tại.
-  // Nhưng bạn muốn “tự động reset đầu tháng” -> ta sẽ “unlock” limited_until nếu qua tháng.
-  await pool.query(`
-    UPDATE r2_accounts
-    SET limited_until = NULL, updated_at = NOW()
-    WHERE limited_until IS NOT NULL
-  `);
-  // usage_monthly là per month, không cần clear
+
+  const rs = await pool.query("SELECT v FROM app_kv WHERE k='month_key' LIMIT 1");
+  const last = rs.rowCount ? String(rs.rows[0].v || "") : "";
+
+  if (last !== mk) {
+    // sang tháng mới -> reset cooldown
+    await pool.query(`UPDATE r2_accounts SET limited_until=NULL, updated_at=NOW()`);
+    await pool.query(
+      `
+      INSERT INTO app_kv (k, v, updated_at)
+      VALUES ('month_key', $1, NOW())
+      ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()
+      `,
+      [mk]
+    );
+    console.log(`🔄 Monthly reset triggered. New month_key=${mk}`);
+  }
+
   return mk;
 }
 
@@ -210,7 +263,6 @@ async function ensureMonthlyReset() {
 async function pickEligibleAccount(fileSizeBytes) {
   const mk = await ensureMonthlyReset();
 
-  // lấy list accounts (ưu tiên account id nhỏ)
   const rs = await pool.query(`
     SELECT *
     FROM r2_accounts
@@ -218,9 +270,19 @@ async function pickEligibleAccount(fileSizeBytes) {
     ORDER BY id ASC
   `);
 
-  if (rs.rowCount === 0) return { ok: false, reason: "no_accounts" };
+  if (rs.rowCount === 0) return { ok: false, reason: "no_accounts", month_key: mk };
 
-  for (const acc of rs.rows) {
+  for (const acc0 of rs.rows) {
+    const acc = {
+      ...acc0,
+      endpoint: normalizeEndpoint(acc0.endpoint, acc0.account_id),
+    };
+
+    // Validate tối thiểu
+    if (!acc.bucket || !acc.endpoint || !acc.access_key_id || !acc.secret_access_key) {
+      continue;
+    }
+
     // cooldown check
     if (acc.limited_until && new Date(acc.limited_until).getTime() > Date.now()) {
       continue;
@@ -245,14 +307,15 @@ async function pickEligibleAccount(fileSizeBytes) {
     );
   }
 
-  return { ok: false, reason: "all_limited" };
+  return { ok: false, reason: "all_limited", month_key: mk };
 }
 
 function makeS3Client(acc) {
-  // Cloudflare R2 dùng S3 compatible
+  // ✅ FIX QUAN TRỌNG: forcePathStyle để không tạo kiểu <bucket>.<host>
   return new S3Client({
     region: "auto",
     endpoint: acc.endpoint,
+    forcePathStyle: true,
     credentials: {
       accessKeyId: acc.access_key_id,
       secretAccessKey: acc.secret_access_key,
@@ -309,108 +372,132 @@ app.post("/api/login", async (req, res) => {
 });
 
 // ===== Hidden upload endpoint =====
-app.post(
-  "/hidden-upload",
-  requireHiddenToken,
-  upload.single("file"),
-  async (req, res) => {
-    try {
-      const session_id = (req.body?.session_id || "").toString().trim();
-      const kind = (req.body?.kind || "").toString().trim(); // input|output
-      const file = req.file;
+app.post("/hidden-upload", requireHiddenToken, upload.single("file"), async (req, res) => {
+  try {
+    const session_id = (req.body?.session_id || "").toString().trim();
+    const kind = (req.body?.kind || "").toString().trim(); // input|output
+    const file = req.file;
 
-      if (!session_id || !kind) {
-        return res.status(400).json({ success: false, message: "Missing session_id/kind" });
-      }
-      if (!file || !file.buffer) {
-        return res.status(400).json({ success: false, message: "Missing file" });
-      }
+    if (!session_id || !kind) {
+      return res.status(400).json({ success: false, message: "Missing session_id/kind" });
+    }
+    if (!["input", "output"].includes(kind)) {
+      return res.status(400).json({ success: false, message: "kind must be input|output" });
+    }
+    if (!file || !file.buffer) {
+      return res.status(400).json({ success: false, message: "Missing file" });
+    }
 
-      const fileSize = file.size || file.buffer.length || 0;
+    const fileSize = file.size || file.buffer.length || 0;
 
-      // pick eligible account
-      const pick = await pickEligibleAccount(fileSize);
-      if (!pick.ok) {
-        return res.status(429).json({ success: false, message: `No eligible R2 account: ${pick.reason}` });
-      }
-
-      const acc = pick.account;
-      const s3 = makeS3Client(acc);
-
-      // object key
-      const safeName = (file.originalname || "file.xlsx").replace(/[^\w.\-]+/g, "_");
-      const hash = sha1Short(file.buffer);
-      const key = `${R2_KEY_PREFIX}/${session_id}/${kind}/${Date.now()}_${hash}_${safeName}`;
-
-      // upload to R2
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: acc.bucket,
-          Key: key,
-          Body: file.buffer,
-          ContentType: file.mimetype || "application/octet-stream",
-        })
-      );
-
-      // update usage + log
-      await addUsage(acc.id, pick.month_key, fileSize);
-
-      await pool.query(
-        `
-        INSERT INTO r2_upload_logs (session_id, kind, original_name, size_bytes, object_key, account_id_ref)
-        VALUES ($1,$2,$3,$4,$5,$6)
-        `,
-        [session_id, kind, file.originalname || "", fileSize, key, acc.id]
-      );
-
-      return res.json({
-        success: true,
-        object_key: key,
-        bucket: acc.bucket,
-        account_name: acc.name,
-        size_bytes: fileSize,
+    // pick eligible account
+    const pick = await pickEligibleAccount(fileSize);
+    if (!pick.ok) {
+      return res.status(429).json({
+        success: false,
+        message: `No eligible R2 account: ${pick.reason}`,
         month_key: pick.month_key,
       });
-    } catch (e) {
-      console.error("❌ /hidden-upload error name:", e?.name);
-      console.error("❌ /hidden-upload error message:", e?.message);
-      console.error("❌ /hidden-upload error stack:", e?.stack);
-      return res.status(500).json({
-        success: false,
-        message: "Server error",
-        error_name: e?.name || "",
-        error_message: e?.message || "",
-      });
     }
+
+    const acc = pick.account;
+    const s3 = makeS3Client(acc);
+
+    // object key
+    const safeName = (file.originalname || "file.xlsx").replace(/[^\w.\-]+/g, "_");
+    const hash = sha1Short(file.buffer);
+    const key = `${R2_KEY_PREFIX}/${session_id}/${kind}/${Date.now()}_${hash}_${safeName}`;
+
+    // upload to R2
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: acc.bucket,
+        Key: key,
+        Body: file.buffer,
+        ContentType:
+          file.mimetype ||
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      })
+    );
+
+    // update usage + log
+    await addUsage(acc.id, pick.month_key, fileSize);
+
+    await pool.query(
+      `
+      INSERT INTO r2_upload_logs (session_id, kind, original_name, size_bytes, object_key, account_id_ref)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      `,
+      [session_id, kind, file.originalname || "", fileSize, key, acc.id]
+    );
+
+    return res.json({
+      success: true,
+      object_key: key,
+      bucket: acc.bucket,
+      account_name: acc.name,
+      size_bytes: fileSize,
+      month_key: pick.month_key,
+    });
+  } catch (e) {
+    console.error("❌ /hidden-upload error name:", e?.name);
+    console.error("❌ /hidden-upload error message:", e?.message);
+    console.error("❌ /hidden-upload error stack:", e?.stack);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error_name: e?.name || "",
+      error_message: e?.message || "",
+    });
   }
-);
+});
 
 // ===== Endpoint xem account status/limit =====
 app.get("/hidden/accounts", requireHiddenToken, async (req, res) => {
   try {
-    const mk = monthKeyUTC();
-    const rs = await pool.query(`
+    const mk = await ensureMonthlyReset();
+
+    const rs = await pool.query(
+      `
       SELECT a.*,
-        COALESCE(u.used_bytes, 0) as used_bytes,
-        $1::text as month_key
+        COALESCE(u.used_bytes, 0) as used_bytes
       FROM r2_accounts a
       LEFT JOIN r2_usage_monthly u
         ON u.account_id_ref = a.id AND u.month_key = $1
       ORDER BY a.id ASC
-    `, [mk]);
+      `,
+      [mk]
+    );
 
-    const out = rs.rows.map(r => ({
-      id: r.id,
-      name: r.name,
-      bucket: r.bucket,
-      endpoint: r.endpoint,
-      is_disabled: r.is_disabled,
-      limited_until: r.limited_until,
-      used_bytes: Number(r.used_bytes || 0),
-      soft_limit_bytes: SOFT_LIMIT_BYTES,
-      soft_limit_gb: R2_MONTHLY_SOFT_LIMIT_GB,
-      month_key: mk,
-    }));
+    const out = rs.rows.map((r) => {
+      const used = Number(r.used_bytes || 0);
+      const limited = r.limited_until && new Date(r.limited_until).getTime() > Date.now();
+      const eligible =
+        !r.is_disabled &&
+        !limited &&
+        normalizeEndpoint(r.endpoint, r.account_id) &&
+        used < SOFT_LIMIT_BYTES;
+
+      let reason = "ok";
+      if (r.is_disabled) reason = "disabled";
+      else if (limited) reason = "cooldown";
+      else if (used >= SOFT_LIMIT_BYTES) reason = "soft_limit";
+
+      return {
+        id: r.id,
+        name: r.name,
+        bucket: r.bucket,
+        endpoint: normalizeEndpoint(r.endpoint, r.account_id),
+        is_disabled: r.is_disabled,
+        limited_until: r.limited_until,
+        used_bytes: used,
+        soft_limit_bytes: SOFT_LIMIT_BYTES,
+        soft_limit_gb: R2_MONTHLY_SOFT_LIMIT_GB,
+        month_key: mk,
+        eligible,
+        reason,
+      };
+    });
 
     res.json({ success: true, accounts: out });
   } catch (e) {
@@ -422,9 +509,18 @@ app.get("/hidden/accounts", requireHiddenToken, async (req, res) => {
 // ===== Manual reset (optional) =====
 app.post("/hidden/reset-month", requireHiddenToken, async (req, res) => {
   try {
-    // reset “cooldown”
     await pool.query(`UPDATE r2_accounts SET limited_until=NULL, updated_at=NOW()`);
-    res.json({ success: true, message: "Reset limited_until done" });
+    // cập nhật month_key = hiện tại để tránh reset lặp
+    const mk = monthKeyUTC();
+    await pool.query(
+      `
+      INSERT INTO app_kv (k, v, updated_at)
+      VALUES ('month_key', $1, NOW())
+      ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()
+      `,
+      [mk]
+    );
+    res.json({ success: true, message: "Reset limited_until done", month_key: mk });
   } catch (e) {
     console.error("❌ /hidden/reset-month:", e);
     res.status(500).json({ success: false, message: "Server error" });
