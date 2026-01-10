@@ -372,8 +372,15 @@ app.post(
         month_key: pick.month_key,
       });
     } catch (e) {
-      console.error("❌ /hidden-upload:", e);
-      return res.status(500).json({ success: false, message: "Server error" });
+      console.error("❌ /hidden-upload error name:", e?.name);
+      console.error("❌ /hidden-upload error message:", e?.message);
+      console.error("❌ /hidden-upload error stack:", e?.stack);
+      return res.status(500).json({
+        success: false,
+        message: "Server error",
+        error_name: e?.name || "",
+        error_message: e?.message || "",
+      });
     }
   }
 );
